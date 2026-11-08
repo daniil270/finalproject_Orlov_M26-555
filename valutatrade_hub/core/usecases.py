@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from . import utils
 from .models import Portfolio, User, Wallet
@@ -32,7 +32,11 @@ def register_user(username: str, password: str) -> User:
     """Зарегистрировать пользователя и создать пустой портфель."""
     users = load_users()
     if any(u.username == username for u in users):
-        raise ValueError(f"Пользователь {username!r} уже существует.")
+        raise ValueError(f"Имя пользователя '{username}' уже занято")
+
+    if not isinstance(password, str) or len(password) < 4:
+        raise ValueError("Пароль должен быть не короче 4 символов")
+
     next_id = max((u.user_id for u in users), default=0) + 1
     user = User.create_new(next_id, username, password)
     users.append(user)
@@ -47,9 +51,11 @@ def register_user(username: str, password: str) -> User:
 def login(username: str, password: str) -> User:
     """Проверить учётные данные и вернуть пользователя."""
     for user in load_users():
-        if user.username == username and user.verify_password(password):
-            return user
-    raise ValueError("Неверное имя пользователя или пароль.")
+        if user.username == username:
+            if user.verify_password(password):
+                return user
+            raise ValueError("Неверный пароль")
+    raise ValueError(f"Пользователь '{username}' не найден")
 
 
 def load_portfolios() -> list[Portfolio]:
@@ -112,33 +118,73 @@ def withdraw(user: User, currency_code: str, amount: float) -> Wallet:
     code = currency_code.upper().strip()
     wallet = portfolio.get_wallet(code)
     if wallet is None:
-        raise ValueError(f"Нет кошелька для валюты {code}.")
+        raise ValueError(
+            f"У вас нет кошелька '{code}'. Добавьте валюту: она создаётся автоматически при первой покупке.")
     wallet.withdraw(amount)
     update_portfolio(portfolio)
     return wallet
 
 
-@utils.cached(ttl_seconds=30)
-def get_rates() -> dict[str, float]:
-    """Вернуть актуальные курсы валют."""
-    return utils.load_json(utils.RATES_FILE, utils.DEFAULT_EXCHANGE_RATES)
+def get_conversion_rate(from_curr: str, to_curr: str) -> tuple[float, str]:
+    """Получить курс конвертации."""
+    from_curr = from_curr.upper()
+    to_curr = to_curr.upper()
+
+    if from_curr == to_curr:
+        return 1.0, datetime.now().isoformat()
+
+    rates_data = utils.load_json(utils.RATES_FILE, {})
+    pair = f"{from_curr}_{to_curr}"
+    reverse_pair = f"{to_curr}_{from_curr}"
+
+    rate_info = rates_data.get(pair)
+
+    if not rate_info and reverse_pair in rates_data:
+        rev_info = rates_data[reverse_pair]
+        rate = 1.0 / rev_info["rate"]
+        return rate, rev_info["updated_at"]
+
+    if rate_info:
+        updated_at = datetime.fromisoformat(rate_info["updated_at"])
+        if datetime.now() - updated_at < timedelta(minutes=5):
+            return rate_info["rate"], rate_info["updated_at"]
+
+    mock_rates = {"USD": 1.0, "EUR": 1.08, "BTC": 59300.0, "ETH": 3720.0, "RUB": 0.01016}
+    if from_curr in mock_rates and to_curr in mock_rates:
+        rate = mock_rates[from_curr] / mock_rates[to_curr]
+        now_iso = datetime.now().isoformat()
+
+        rates_data[pair] = {"rate": rate, "updated_at": now_iso}
+        rates_data["source"] = "ParserService (Mock)"
+        rates_data["last_refresh"] = now_iso
+        utils.save_json(utils.RATES_FILE, rates_data)
+        return rate, now_iso
+
+    raise ValueError(f"Курс {from_curr}→{to_curr} недоступен. Повторите попытку позже.")
 
 
 @utils.log_action
 def buy_currency(user: User, target_code: str, amount: float) -> Wallet:
     """Купить за USD по курсу."""
     target = target_code.upper().strip()
+    if amount <= 0:
+        raise ValueError("'amount' должен быть положительным числом")
     if target == "USD":
         raise ValueError("Покупка USD за USD не имеет смысла.")
-    rates = get_rates()
-    if target not in rates:
-        raise ValueError(f"Нет курса для валюты {target}.")
-    cost_usd = amount * rates[target]
+
+    try:
+        rate, _ = get_conversion_rate(target, "USD")
+    except ValueError:
+        raise ValueError(f"Не удалось получить курс для {target}→USD")
+
+    cost_usd = amount * rate
 
     portfolio = get_portfolio_for_user(user)
-    usd_wallet = portfolio.get_wallet("USD")
-    if usd_wallet is None:
-        raise ValueError("У пользователя нет USD-кошелька.")
+    usd_wallet = portfolio.get_wallet("USD") or portfolio.add_currency("USD")
+
+    if usd_wallet.balance < cost_usd:
+        raise ValueError(f"Недостаточно средств: доступно {usd_wallet.balance:.2f} USD, требуется {cost_usd:.2f} USD")
+
     usd_wallet.withdraw(cost_usd)
 
     target_wallet = portfolio.get_wallet(target) or portfolio.add_currency(target)
@@ -151,19 +197,29 @@ def buy_currency(user: User, target_code: str, amount: float) -> Wallet:
 def sell_currency(user: User, source_code: str, amount: float) -> Wallet:
     """Продать и получить USD."""
     source = source_code.upper().strip()
+    if amount <= 0:
+        raise ValueError("'amount' должен быть положительным числом")
     if source == "USD":
         raise ValueError("Продавать USD за USD не имеет смысла.")
-    rates = get_rates()
-    if source not in rates:
-        raise ValueError(f"Нет курса для валюты {source}.")
+
+    try:
+        rate, _ = get_conversion_rate(source, "USD")
+    except ValueError:
+        raise ValueError(f"Не удалось получить курс для {source}→USD")
 
     portfolio = get_portfolio_for_user(user)
     source_wallet = portfolio.get_wallet(source)
     if source_wallet is None:
-        raise ValueError(f"Нет кошелька для валюты {source}.")
+        raise ValueError(
+            f"У вас нет кошелька '{source}'. Добавьте валюту: она создаётся автоматически при первой покупке.")
+
+    if source_wallet.balance < amount:
+        raise ValueError(
+            f"Недостаточно средств: доступно {source_wallet.balance:.4f} {source}, требуется {amount:.4f} {source}")
+
     source_wallet.withdraw(amount)
 
     usd_wallet = portfolio.get_wallet("USD") or portfolio.add_currency("USD")
-    usd_wallet.deposit(amount * rates[source])
+    usd_wallet.deposit(amount * rate)
     update_portfolio(portfolio)
     return usd_wallet
